@@ -13,7 +13,7 @@ define('DB_PATH', __DIR__ . '/../database/dfd.sqlite');
 // Diretório do banco de dados
 $dbDir = dirname(DB_PATH);
 if (!is_dir($dbDir)) {
-    mkdir($dbDir, 0755, true);
+    mkdir($dbDir, 0750, true);
 }
 
 // Iniciar sessão
@@ -124,7 +124,8 @@ function initializeDatabase(PDO $db): void {
     
     // Inserir usuário admin padrão (senha: admin123)
     $senhaHash = password_hash('admin123', PASSWORD_DEFAULT);
-    $db->exec("INSERT INTO usuarios (nome, email, senha, is_admin, ativo) VALUES ('Administrador', 'admin@sistema.com', '$senhaHash', 1, 1)");
+    $stmt = $db->prepare("INSERT INTO usuarios (nome, email, senha, is_admin, ativo) VALUES (?, ?, ?, ?, ?)");
+    $stmt->execute(['Administrador', 'admin@sistema.com', $senhaHash, 1, 1]);
     
     // Inserir alguns centros de custo de exemplo
     $db->exec("
@@ -159,6 +160,24 @@ function login(string $email, string $senha): bool {
 }
 
 function logout(): void {
+    // Unset all session variables
+    $_SESSION = [];
+    
+    // Delete the session cookie
+    if (ini_get('session.use_cookies')) {
+        $params = session_get_cookie_params();
+        setcookie(
+            session_name(),
+            '',
+            time() - 42000,
+            $params['path'],
+            $params['domain'],
+            $params['secure'],
+            $params['httponly']
+        );
+    }
+    
+    // Destroy the session
     session_destroy();
 }
 
@@ -223,9 +242,30 @@ function formatDate(?string $date): string {
 function gerarNumeroDFD(): string {
     $db = getDB();
     $ano = date('Y');
-    $stmt = $db->query("SELECT COUNT(*) + 1 as seq FROM dfds WHERE strftime('%Y', created_at) = '$ano'");
-    $seq = $stmt->fetchColumn();
-    return sprintf('DFD-%s/%04d', $ano, $seq);
+    
+    // Use a transaction to prevent race conditions
+    $db->beginTransaction();
+    try {
+        $stmt = $db->prepare("SELECT COUNT(*) + 1 as seq FROM dfds WHERE strftime('%Y', created_at) = ?");
+        $stmt->execute([$ano]);
+        $seq = $stmt->fetchColumn();
+        $numero = sprintf('DFD-%s/%04d', $ano, $seq);
+        
+        // Check if the number already exists and increment if needed
+        $checkStmt = $db->prepare("SELECT COUNT(*) FROM dfds WHERE numero = ?");
+        $checkStmt->execute([$numero]);
+        while ($checkStmt->fetchColumn() > 0) {
+            $seq++;
+            $numero = sprintf('DFD-%s/%04d', $ano, $seq);
+            $checkStmt->execute([$numero]);
+        }
+        
+        $db->commit();
+        return $numero;
+    } catch (Exception $e) {
+        $db->rollBack();
+        throw $e;
+    }
 }
 
 // ============================================================================
@@ -517,7 +557,11 @@ function renderScripts(): void {
     <script>
         // Confirmação de exclusão
         function confirmDelete(id, numero) {
-            if (confirm('Tem certeza que deseja excluir o DFD ' + numero + '?\n\nEsta ação não pode ser desfeita.')) {
+            // Sanitize the numero parameter to prevent XSS
+            var safeNumero = String(numero).replace(/[<>"'&]/g, function(c) {
+                return {'<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;','&':'&amp;'}[c];
+            });
+            if (confirm('Tem certeza que deseja excluir o DFD ' + safeNumero + '?\n\nEsta ação não pode ser desfeita.')) {
                 window.location.href = 'excluir.php?id=' + id;
             }
         }
